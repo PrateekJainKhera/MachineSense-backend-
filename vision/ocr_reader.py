@@ -169,6 +169,7 @@ class OCRReader:
         frames: List[np.ndarray],
         roi: Optional[ROI] = None,
         min_confidence: float = 0.85,
+        sharpness_threshold: float = 80.0,
     ) -> OCRResult:
         """
         Read counter from multiple frames and return the majority-vote result.
@@ -213,7 +214,7 @@ class OCRReader:
         total_successful = 0
 
         for frame in frames:
-            result = self.read_counter(frame, roi=roi)
+            result = self.read_counter(frame, roi=roi, sharpness_threshold=sharpness_threshold)
             if result.success and result.value is not None and result.confidence >= min_confidence:
                 votes[result.value] += 1
                 confidences.setdefault(result.value, []).append(result.confidence)
@@ -420,11 +421,11 @@ class OCRReader:
         Preprocessing pipeline for industrial machine display images.
 
         Pipeline:
-          1. Upscale to ≥600px wide  — OCR accuracy drops on small text
+          1. Upscale to ≥1200px wide — ensures distant/small digits have enough pixels for OCR
           2. Grayscale
-          3. CLAHE                   — boosts local contrast; handles glare/uneven LCD backlight
+          3. CLAHE (4×4 tile)        — fine-grained local contrast for small distant digits
           4. Gaussian denoise        — removes sensor noise without blurring digit edges
-          5. Sharpen                 — crisp digit edges for EasyOCR
+          5. Sharpen (aggressive)    — crisp edges critical for distant digits
           6. Otsu threshold          — auto-separates digits from background (LCD/touchscreen)
           7. Invert if needed        — handles both light-on-dark and dark-on-light displays
         """
@@ -438,8 +439,6 @@ class OCRReader:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         # 3. CLAHE — Contrast Limited Adaptive Histogram Equalization
-        #    Normalises uneven brightness across the display (e.g. ambient light hitting
-        #    the LCD glass at an angle creates bright patches on one side).
         #    clipLimit=2.0 suppresses noise amplification; 8×8 tile matches digit size at 600px.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)

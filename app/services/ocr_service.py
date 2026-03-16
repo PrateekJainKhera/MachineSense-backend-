@@ -158,8 +158,11 @@ class OCRService:
         if camera_id not in self._cameras:
             return False
         self._rois[camera_id] = (roi.x, roi.y, roi.width, roi.height)
-        # Clear cached reading so the next result comes from within the new ROI
+        # Clear cached reading AND validation baseline — the new ROI may point at a
+        # completely different part of the screen, so the old accepted value is meaningless.
         self._latest_valid.pop(camera_id, None)
+        self._last_accepted.pop(camera_id, None)
+        self._rate_history[camera_id] = deque(maxlen=RATE_HISTORY_SIZE)
         logger.info(f"ROI updated for camera '{camera_id}': {roi}")
         return True
 
@@ -269,7 +272,8 @@ class OCRService:
                         continue
 
                     result = self._reader.read_counter_consensus(
-                        frames, roi=roi, min_confidence=LIVE_MIN_CONFIDENCE
+                        frames, roi=roi, min_confidence=LIVE_MIN_CONFIDENCE,
+                        sharpness_threshold=80.0,
                     )
                     min_conf = LIVE_MIN_CONFIDENCE
 

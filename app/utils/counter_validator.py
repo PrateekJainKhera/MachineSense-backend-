@@ -10,6 +10,7 @@ class ValidationResult:
     confidence_ok: bool        # confidence passed the threshold
     rate_ok: bool              # value change is physically possible
     direction_ok: bool         # counter didn't go backwards unexpectedly
+    digit_count_ok: bool       # digit count matches previous reading
     reason: str                # human-readable explanation
 
     def to_dict(self) -> dict:
@@ -18,6 +19,7 @@ class ValidationResult:
             "confidence_ok": self.confidence_ok,
             "rate_ok": self.rate_ok,
             "direction_ok": self.direction_ok,
+            "digit_count_ok": self.digit_count_ok,
             "reason": self.reason,
         }
 
@@ -76,6 +78,7 @@ def validate_reading(
             confidence_ok=False,
             rate_ok=True,
             direction_ok=True,
+            digit_count_ok=True,
             reason=(
                 f"Confidence {new_confidence:.3f} is below threshold {min_confidence}. "
                 f"Reading rejected — digit may be mid-transition or obscured."
@@ -89,6 +92,7 @@ def validate_reading(
             confidence_ok=True,
             rate_ok=True,
             direction_ok=True,
+            digit_count_ok=True,
             reason="First reading — no rate comparison available. Accepted.",
         )
 
@@ -110,18 +114,63 @@ def validate_reading(
             confidence_ok=True,
             rate_ok=True,
             direction_ok=False,
+            digit_count_ok=True,
             reason=(
                 f"Counter went backwards: {prev_value} → {new_value} (delta={delta}). "
                 f"Rejected — likely a bad OCR read of a digit (noise tolerance={noise_tolerance})."
             ),
         )
 
-    # ── Check 2b: Rate — change must be physically possible ──────────
-    # Skip rate check if we just came from a reset/near-zero baseline.
-    # When counter resets to 0 (or OCR briefly reads near-0 on a garbled frame),
-    # the next real reading will look like a huge jump from ~0 → 18917, which is
-    # physically fine — the machine was already at 18917, we just lost the baseline.
+    # ── Check 2b: Noise recovery — prev baseline poisoned by bad OCR ─
+    # Must run BEFORE digit count check so a bad low-digit baseline (e.g. prev=2)
+    # doesn't permanently block all correct high-digit reads (e.g. new=18917).
+    # Happens when: display shows "19,031", comma splits the detection into "19"
+    # and "031", and the small fragment gets accepted first. Subsequent correct
+    # reads (19031) then look like impossible jumps from 105/190.
+    # Rule: if prev < 500 AND new > 1000 AND new confidence >= 0.90, trust the
+    # high-confidence read and reset the baseline.
     coming_from_reset = prev_value < 100
+    prev_was_likely_noise = (
+        prev_value < 500
+        and new_value > 1000
+        and new_confidence >= 0.90
+    )
+    if prev_was_likely_noise:
+        return ValidationResult(
+            is_valid=True,
+            confidence_ok=True,
+            rate_ok=True,
+            direction_ok=True,
+            digit_count_ok=True,
+            reason=(
+                f"Previous value {prev_value} likely OCR noise (fragment of larger number). "
+                f"New reading {new_value} at conf={new_confidence:.2f} accepted as new baseline."
+            ),
+        )
+    # ── Check 2c: Digit count — must match previous reading ──────────
+    # A 5-digit counter reading as 3 digits is always an OCR error.
+    # Example: prev=18944 (5 digits), new=111 (3 digits) → reject.
+    # Allow ±1 digit for natural rollover: 99999 (5) → 100001 (6) is valid.
+    # Skip this check on reset (counter returning to near-zero is a job reset).
+    prev_digit_count = len(str(prev_value))
+    new_digit_count  = len(str(new_value))
+    digit_count_ok   = abs(new_digit_count - prev_digit_count) <= 1
+
+    if not digit_count_ok and not is_reset:
+        return ValidationResult(
+            is_valid=False,
+            confidence_ok=True,
+            rate_ok=True,
+            direction_ok=True,
+            digit_count_ok=False,
+            reason=(
+                f"Digit count mismatch: prev={prev_value} ({prev_digit_count} digits) "
+                f"→ new={new_value} ({new_digit_count} digits). "
+                f"Rejected — OCR likely read a partial or wrong number."
+            ),
+        )
+
+    # ── Check 2d: Rate — change must be physically possible ──────────
     max_allowed = max_rate_per_second * elapsed_seconds * 1.2 if elapsed_seconds > 0 else 0
     # Only rate-check LARGE deltas (> 50). Small deltas (≤ 50) are OCR noise on the same
     # counter digit — e.g. reading 18917 then 18929 in 0.5s is noise, not a real jump.
@@ -137,6 +186,7 @@ def validate_reading(
                 confidence_ok=True,
                 rate_ok=False,
                 direction_ok=True,
+                digit_count_ok=True,
                 reason=(
                     f"Counter jumped {delta} in {elapsed_seconds:.1f}s "
                     f"({actual_rate:.1f}/sec) — exceeds machine max "
@@ -154,6 +204,7 @@ def validate_reading(
         confidence_ok=True,
         rate_ok=True,
         direction_ok=True,
+        digit_count_ok=True,
         reason=(
             f"Valid. Counter: {prev_value} → {new_value} "
             f"(+{delta} in {elapsed_seconds:.1f}s, {actual_rate:.1f}/sec)."
