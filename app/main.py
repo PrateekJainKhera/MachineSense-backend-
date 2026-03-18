@@ -5,8 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes import ocr as ocr_router
 from app.routes import sheet as sheet_router
+from app.routes import worker as worker_router
+from app.routes import shift as shift_router
 from app.services.ocr_service import OCRService
 from app.services.sheet_service import SheetService
+from app.services.worker_service import WorkerService
 
 # ------------------------------------------------------------------
 # Logging setup
@@ -27,6 +30,7 @@ async def lifespan(app: FastAPI):
     logger.info("=== Machine Sense Backend Starting ===")
     app.state.ocr_service = OCRService()      # EasyOCR model loads here
     app.state.sheet_service = SheetService()  # YOLOv8 loads per camera on register
+    app.state.worker_service = WorkerService()  # YOLOv8 person tracker
     logger.info("=== Startup complete. Ready to accept requests. ===")
 
     yield  # App runs here
@@ -34,6 +38,7 @@ async def lifespan(app: FastAPI):
     logger.info("=== Machine Sense Backend Shutting Down ===")
     app.state.ocr_service.shutdown()
     app.state.sheet_service.shutdown()
+    app.state.worker_service.shutdown()
 
 
 # ------------------------------------------------------------------
@@ -44,7 +49,8 @@ app = FastAPI(
     description=(
         "AI Machine & Worker Monitoring System\n\n"
         "- **Phase 1** `/ocr/...` — Read machine counter values using EasyOCR + OpenCV\n"
-        "- **Phase 2** `/sheets/...` — Count sheets using YOLOv8 + ByteTrack"
+        "- **Phase 2** `/workers/...` — Worker presence & activity tracking using YOLOv8\n"
+        "- **Phase 3** `/sheets/...` — Count sheets using YOLOv8 + ByteTrack"
     ),
     version="0.2.0",
     lifespan=lifespan,
@@ -63,6 +69,8 @@ app.add_middleware(
 # Routers
 # ------------------------------------------------------------------
 app.include_router(ocr_router.router)
+app.include_router(worker_router.router)
+app.include_router(shift_router.router)
 app.include_router(sheet_router.router)
 
 
@@ -71,7 +79,7 @@ app.include_router(sheet_router.router)
 # ------------------------------------------------------------------
 @app.get("/", tags=["Health"])
 def root():
-    return {"status": "ok", "system": "Machine Sense", "phase": 2}
+    return {"status": "ok", "system": "Machine Sense", "phase": "2 (worker tracking)"}
 
 
 @app.get("/health", tags=["Health"])
