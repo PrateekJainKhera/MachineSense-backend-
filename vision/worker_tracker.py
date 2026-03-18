@@ -198,9 +198,10 @@ class WorkerTracker:
         self.idle_timeout        = idle_timeout
         self.maintenance_alert_s = maintenance_alert_s
 
-        self._persons:       Dict[int, _PersonTrack] = {}
-        self._label_counter: int                     = 0
-        self._event_log:     deque                   = deque(maxlen=event_log_size)
+        self._persons:         Dict[int, _PersonTrack] = {}
+        self._label_counter:   int                     = 0
+        self._event_log:       deque                   = deque(maxlen=event_log_size)
+        self._completed_stats: List[dict]              = []   # stats saved before track purge
 
         # Rack zone — normalized rect (set via set_rack_zone)
         # stored as pixel fractions: (x, y, w, h) all 0-1
@@ -346,25 +347,29 @@ class WorkerTracker:
     def get_person_stats(self) -> List[dict]:
         """
         Cumulative stats per person — used for shift productivity calculation.
-        Returns stats for all persons who have ever been seen.
+        Returns stats for all persons who have ever been seen (including purged tracks).
         """
-        stats = []
+        stats = list(self._completed_stats)   # include purged-but-counted tracks
+        active_ids = {s["track_id"] for s in stats}
         for t in self._persons.values():
+            if t.track_id in active_ids:
+                continue   # already saved (shouldn't happen, but guard)
             if not t.was_present and t.total_active_s == 0 and t.total_idle_s == 0:
                 continue
             stats.append({
-                "track_id":       t.track_id,
-                "label":          t.label,
-                "total_active_s": round(t.total_active_s, 1),
-                "total_idle_s":   round(t.total_idle_s, 1),
-                "total_bending_s":round(t.total_bending_s, 1),
-                "bending_events": t.bending_events,
-                "sheet_picks":    t.sheet_picks,
+                "track_id":        t.track_id,
+                "label":           t.label,
+                "total_active_s":  round(t.total_active_s, 1),
+                "total_idle_s":    round(t.total_idle_s, 1),
+                "total_bending_s": round(t.total_bending_s, 1),
+                "bending_events":  t.bending_events,
+                "sheet_picks":     t.sheet_picks,
             })
         return stats
 
     def reset(self) -> None:
         self._persons.clear()
+        self._completed_stats.clear()
         self._label_counter = 0
         self._event_log.clear()
         logger.info("WorkerTracker reset.")
@@ -522,7 +527,18 @@ class WorkerTracker:
                 if (now - track.last_seen).total_seconds() > self.STALE_PURGE_S:
                     to_delete.append(tid)
         for tid in to_delete:
-            logger.debug(f"Purging stale track tid={tid} ({self._persons[tid].label})")
+            t = self._persons[tid]
+            logger.debug(f"Purging stale track tid={tid} ({t.label})")
+            # Save stats before deleting so shift report doesn't lose picks
+            self._completed_stats.append({
+                "track_id":        t.track_id,
+                "label":           t.label,
+                "total_active_s":  round(t.total_active_s, 1),
+                "total_idle_s":    round(t.total_idle_s, 1),
+                "total_bending_s": round(t.total_bending_s, 1),
+                "bending_events":  t.bending_events,
+                "sheet_picks":     t.sheet_picks,
+            })
             del self._persons[tid]
         if not self._persons:
             self._label_counter = 0

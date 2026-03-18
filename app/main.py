@@ -7,9 +7,11 @@ from app.routes import ocr as ocr_router
 from app.routes import sheet as sheet_router
 from app.routes import worker as worker_router
 from app.routes import shift as shift_router
+from app.routes import qc as qc_router
 from app.services.ocr_service import OCRService
 from app.services.sheet_service import SheetService
 from app.services.worker_service import WorkerService
+from app.services.qc_service import QCService
 
 # ------------------------------------------------------------------
 # Logging setup
@@ -31,6 +33,7 @@ async def lifespan(app: FastAPI):
     app.state.ocr_service = OCRService()      # EasyOCR model loads here
     app.state.sheet_service = SheetService()  # YOLOv8 loads per camera on register
     app.state.worker_service = WorkerService()  # YOLOv8 person tracker
+    app.state.qc_service = QCService()          # QC form entry storage
     logger.info("=== Startup complete. Ready to accept requests. ===")
 
     yield  # App runs here
@@ -39,6 +42,7 @@ async def lifespan(app: FastAPI):
     app.state.ocr_service.shutdown()
     app.state.sheet_service.shutdown()
     app.state.worker_service.shutdown()
+    app.state.qc_service.shutdown()
 
 
 # ------------------------------------------------------------------
@@ -72,6 +76,7 @@ app.include_router(ocr_router.router)
 app.include_router(worker_router.router)
 app.include_router(shift_router.router)
 app.include_router(sheet_router.router)
+app.include_router(qc_router.router)
 
 
 # ------------------------------------------------------------------
