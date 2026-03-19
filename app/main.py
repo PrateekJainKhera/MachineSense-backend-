@@ -8,10 +8,12 @@ from app.routes import sheet as sheet_router
 from app.routes import worker as worker_router
 from app.routes import shift as shift_router
 from app.routes import qc as qc_router
+from app.routes import downtime as downtime_router
 from app.services.ocr_service import OCRService
 from app.services.sheet_service import SheetService
 from app.services.worker_service import WorkerService
 from app.services.qc_service import QCService
+from app.services.downtime_service import DowntimeService
 
 # ------------------------------------------------------------------
 # Logging setup
@@ -30,10 +32,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=== Machine Sense Backend Starting ===")
-    app.state.ocr_service = OCRService()      # EasyOCR model loads here
-    app.state.sheet_service = SheetService()  # YOLOv8 loads per camera on register
-    app.state.worker_service = WorkerService()  # YOLOv8 person tracker
-    app.state.qc_service = QCService()          # QC form entry storage
+    app.state.ocr_service     = OCRService()                                  # EasyOCR model loads here
+    app.state.sheet_service   = SheetService()                                # YOLOv8 loads per camera on register
+    app.state.worker_service  = WorkerService()                               # YOLOv8 person tracker
+    app.state.qc_service      = QCService()                                   # QC form entry storage
+    app.state.downtime_service = DowntimeService(app.state.ocr_service, app.state.worker_service)  # Phase 3 Level 2
     logger.info("=== Startup complete. Ready to accept requests. ===")
 
     yield  # App runs here
@@ -43,6 +46,7 @@ async def lifespan(app: FastAPI):
     app.state.sheet_service.shutdown()
     app.state.worker_service.shutdown()
     app.state.qc_service.shutdown()
+    app.state.downtime_service.shutdown()
 
 
 # ------------------------------------------------------------------
@@ -77,6 +81,7 @@ app.include_router(worker_router.router)
 app.include_router(shift_router.router)
 app.include_router(sheet_router.router)
 app.include_router(qc_router.router)
+app.include_router(downtime_router.router)
 
 
 # ------------------------------------------------------------------
