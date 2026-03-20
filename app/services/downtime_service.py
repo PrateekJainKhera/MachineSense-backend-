@@ -39,16 +39,28 @@ STOPPED_THRESHOLD_S = 15
 POLL_INTERVAL_S = 5
 
 
-BREAKDOWN_THRESHOLD_S = 600   # 10 minutes — long stop with idle worker = breakdown
+def _fmt_s(s: float) -> str:
+    """Format seconds as human-readable string."""
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    if h > 0:   return f"{h}h {m}m"
+    if m > 0:   return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+BREAKDOWN_THRESHOLD_S  = 600   # 10 minutes — long stop with idle worker = breakdown
+UNATTENDED_THRESHOLD_S = 30    # machine running but no worker for this long = alert
 
 
 @dataclass
 class _CameraWatch:
-    camera_id:         str
-    worker_camera_id:  Optional[str]      = None   # Camera 2 ID for cross-reference
-    last_value:        Optional[int]      = None   # last counter value seen
-    last_changed_at:   Optional[datetime] = None   # when counter last changed
-    active_event:      Optional[DowntimeRecord] = None
+    camera_id:            str
+    worker_camera_id:     Optional[str]      = None
+    last_value:           Optional[int]      = None
+    last_changed_at:      Optional[datetime] = None
+    active_event:         Optional[DowntimeRecord] = None
+    unattended_since:     Optional[datetime] = None   # when worker disappeared while running
 
 
 class DowntimeService:
@@ -91,16 +103,22 @@ class DowntimeService:
             watch = self._watches.get(camera_id)
             if watch is None:
                 return None
+            now = datetime.now()
             stopped_secs = 0.0
             if watch.active_event:
-                stopped_secs = (datetime.now() - watch.active_event.started_at).total_seconds()
+                stopped_secs = (now - watch.active_event.started_at).total_seconds()
+            unattended_secs = 0.0
+            if watch.unattended_since:
+                unattended_secs = (now - watch.unattended_since).total_seconds()
             return DowntimeStatus(
-                camera_id       = camera_id,
-                machine_running = watch.active_event is None,
-                stopped_since   = watch.active_event.started_at if watch.active_event else None,
-                stopped_secs    = round(stopped_secs, 1),
-                last_counter    = watch.last_value,
-                last_seen_at    = watch.last_changed_at,
+                camera_id         = camera_id,
+                machine_running   = watch.active_event is None,
+                stopped_since     = watch.active_event.started_at if watch.active_event else None,
+                stopped_secs      = round(stopped_secs, 1),
+                last_counter      = watch.last_value,
+                last_seen_at      = watch.last_changed_at,
+                unattended_alert  = watch.unattended_since is not None and unattended_secs >= UNATTENDED_THRESHOLD_S,
+                unattended_secs   = round(unattended_secs, 1),
             )
 
     def get_events(self, camera_id: str) -> List[DowntimeRecord]:
@@ -124,6 +142,175 @@ class DowntimeService:
                 longest_event_s  = round(longest, 1),
                 active_event     = active,
             )
+
+    def get_oee(self, camera_id: str, worker_camera_id: Optional[str] = None):
+        """Calculate OEE Availability for the current active shift window."""
+        from app.models.downtime_model import OEEResult
+        now = datetime.now()
+
+        # Get shift start time from worker service
+        shift_start = None
+        if self._worker and worker_camera_id:
+            try:
+                shift = self._worker.get_active_shift(worker_camera_id)
+                if shift:
+                    shift_start = shift.started_at
+            except Exception:
+                pass
+
+        if shift_start is None:
+            # No shift — use all recorded events
+            shift_start = min((e.started_at for e in self._events if e.camera_id == camera_id), default=now)
+
+        shift_duration_s = max((now - shift_start).total_seconds(), 1)
+
+        # Sum downtime events that overlap with shift window
+        with self._lock:
+            events = [e for e in self._events if e.camera_id == camera_id]
+
+        downtime_s = 0.0
+        for e in events:
+            start = max(e.started_at, shift_start)
+            end   = e.ended_at if e.ended_at else now
+            overlap = (end - start).total_seconds()
+            if overlap > 0:
+                downtime_s += overlap
+
+        uptime_s         = max(shift_duration_s - downtime_s, 0)
+        availability_pct = round((uptime_s / shift_duration_s) * 100, 1)
+
+        return OEEResult(
+            camera_id        = camera_id,
+            shift_duration_s = round(shift_duration_s, 1),
+            downtime_s       = round(downtime_s, 1),
+            uptime_s         = round(uptime_s, 1),
+            availability_pct = availability_pct,
+        )
+
+    def get_history(self, camera_id: str):
+        """Level 3 — historical statistics across all resolved events."""
+        from app.models.downtime_model import HistoryStats
+        with self._lock:
+            resolved = [e for e in self._events
+                        if e.camera_id == camera_id and e.status == "resolved" and e.duration_s is not None]
+
+        if not resolved:
+            return HistoryStats(
+                camera_id=camera_id, total_stops=0, total_downtime_s=0,
+                avg_duration_s=0, longest_s=0, most_common_reason="none",
+                reasons_breakdown={}, avg_interval_s=0, last_stop_ago_s=None,
+            )
+
+        total_s      = sum(e.duration_s for e in resolved)
+        avg_s        = total_s / len(resolved)
+        longest      = max(e.duration_s for e in resolved)
+
+        reasons: dict = {}
+        for e in resolved:
+            reasons[e.reason] = reasons.get(e.reason, 0) + 1
+        most_common = max(reasons, key=reasons.get)
+
+        # Avg interval between stop starts
+        sorted_events = sorted(resolved, key=lambda e: e.started_at)
+        intervals = []
+        for i in range(1, len(sorted_events)):
+            gap = (sorted_events[i].started_at - sorted_events[i-1].started_at).total_seconds()
+            intervals.append(gap)
+        avg_interval = sum(intervals) / len(intervals) if intervals else 0
+
+        last_stop_ago = None
+        if sorted_events:
+            last_end = sorted_events[-1].ended_at
+            if last_end:
+                last_stop_ago = round((datetime.now() - last_end).total_seconds(), 1)
+
+        return HistoryStats(
+            camera_id          = camera_id,
+            total_stops        = len(resolved),
+            total_downtime_s   = round(total_s, 1),
+            avg_duration_s     = round(avg_s, 1),
+            longest_s          = round(longest, 1),
+            most_common_reason = most_common,
+            reasons_breakdown  = reasons,
+            avg_interval_s     = round(avg_interval, 1),
+            last_stop_ago_s    = last_stop_ago,
+        )
+
+    def get_pattern(self, camera_id: str):
+        """Level 3 — detect abnormal stop patterns."""
+        from app.models.downtime_model import PatternInsight
+        stats = self.get_history(camera_id)
+
+        if stats.total_stops < 2:
+            return PatternInsight(
+                camera_id=camera_id, avg_interval_s=0,
+                last_stop_ago_s=stats.last_stop_ago_s,
+                overdue=False, high_frequency=False,
+                message="Not enough data yet — need at least 2 stops for pattern analysis.",
+            )
+
+        avg      = stats.avg_interval_s
+        last_ago = stats.last_stop_ago_s or 0
+        overdue  = last_ago > avg * 1.5 if avg > 0 else False
+
+        # Check last 3 intervals vs average
+        with self._lock:
+            resolved = sorted(
+                [e for e in self._events if e.camera_id == camera_id and e.status == "resolved"],
+                key=lambda e: e.started_at
+            )
+        recent_intervals = []
+        for i in range(max(0, len(resolved) - 3), len(resolved)):
+            if i == 0:
+                continue
+            gap = (resolved[i].started_at - resolved[i-1].started_at).total_seconds()
+            recent_intervals.append(gap)
+        recent_avg     = sum(recent_intervals) / len(recent_intervals) if recent_intervals else avg
+        high_frequency = recent_avg < avg * 0.6 if avg > 0 else False
+
+        if high_frequency:
+            msg = f"⚠ Stops more frequent than usual — avg interval {_fmt_s(avg)}, recently {_fmt_s(recent_avg)}"
+        elif overdue:
+            msg = f"Machine overdue for a stop — avg every {_fmt_s(avg)}, last was {_fmt_s(last_ago)} ago"
+        else:
+            msg = f"Normal pattern — machine stops every ~{_fmt_s(avg)} on average"
+
+        return PatternInsight(
+            camera_id       = camera_id,
+            avg_interval_s  = round(avg, 1),
+            last_stop_ago_s = stats.last_stop_ago_s,
+            overdue         = overdue,
+            high_frequency  = high_frequency,
+            message         = msg,
+        )
+
+    def get_csv(self, camera_id: str) -> str:
+        """Level 3 — export all downtime events as CSV string."""
+        with self._lock:
+            events = [e for e in self._events if e.camera_id == camera_id]
+        lines = ["#,Started,Ended,Duration(s),Status,Reason,Worker Present,Worker State"]
+        for e in sorted(events, key=lambda x: x.started_at):
+            lines.append(",".join([
+                str(e.event_id),
+                e.started_at.strftime("%Y-%m-%d %H:%M:%S"),
+                e.ended_at.strftime("%Y-%m-%d %H:%M:%S") if e.ended_at else "",
+                str(e.duration_s or ""),
+                e.status,
+                e.reason,
+                str(e.worker_present) if e.worker_present is not None else "",
+                e.worker_state or "",
+            ]))
+        return "\n".join(lines)
+
+    def override_reason(self, event_id: int, reason: str) -> bool:
+        """Manually override the classified reason for a downtime event."""
+        with self._lock:
+            for event in self._events:
+                if event.event_id == event_id:
+                    event.reason = reason
+                    logger.info(f"Downtime #{event_id} reason manually set to '{reason}'")
+                    return True
+        return False
 
     def shutdown(self) -> None:
         self._running = False
@@ -176,6 +363,8 @@ class DowntimeService:
                 # If there was an active downtime → end it
                 if watch.active_event:
                     self._end_downtime(watch, now)
+                # Machine is running — check worker presence for unattended alert
+                self._check_unattended(watch, now)
                 return
 
             # Counter unchanged — check how long
@@ -192,6 +381,22 @@ class DowntimeService:
             elif watch.active_event is not None:
                 # Already stopped — re-classify reason as more data comes in
                 self._update_classification(watch, now)
+
+    def _check_unattended(self, watch: _CameraWatch, now: datetime) -> None:
+        """Check if machine is running but no worker present — set/clear unattended alert."""
+        if watch.worker_camera_id is None or self._worker is None:
+            return
+        worker_present, _ = self._get_worker_presence(watch.worker_camera_id)
+        if worker_present is None:
+            return   # no data from worker camera
+        if not worker_present:
+            if watch.unattended_since is None:
+                watch.unattended_since = now
+                logger.warning(f"[{watch.camera_id}] Machine running but no worker detected — unattended timer started")
+        else:
+            if watch.unattended_since is not None:
+                watch.unattended_since = None
+                logger.info(f"[{watch.camera_id}] Worker returned — unattended alert cleared")
 
     def _get_worker_presence(self, worker_camera_id: Optional[str]):
         """Check Camera 2 for worker presence and state. Returns (present, state)."""
@@ -235,11 +440,12 @@ class DowntimeService:
         if self._worker is None or worker_camera_id is None:
             return True   # assume shift active if no data
         try:
-            return getattr(self._worker, "_active_shift", {}).get(worker_camera_id) is not None
+            return worker_camera_id in self._worker._active_shifts
         except Exception:
             return True
 
     def _start_downtime(self, watch: _CameraWatch, stopped_since: datetime) -> None:
+        watch.unattended_since = None   # machine stopped — clear unattended alert
         self._counter += 1
         worker_present, worker_state = self._get_worker_presence(watch.worker_camera_id)
         shift_active = self._shift_active(watch.worker_camera_id)
